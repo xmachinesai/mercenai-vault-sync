@@ -1,0 +1,27 @@
+{
+  "name": "@voice-ai/obsidian-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Synchronizes approved Markdown notes from an Obsidian vault into a MERCENAI knowledge base.",
+  "license": "MIT",
+  "author": "MERCENAI",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xmachinesai/mercenai-vault-sync.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xmachinesai/mercenai-vault-sync/issues"
+  },
+  "homepage": "https://mercenai.app",
+  "type": "module",
+  "scripts": {
+    "build": "node esbuild.config.mjs production",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "esbuild": "^0.28.1",
+    "obsidian": "^1.13.1",
+    "typescript": "^5.7.2"
+  }
+}

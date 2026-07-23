@@ -32,7 +32,7 @@ The plugin synchronizes immediately, then synchronizes again when a Markdown not
 - The plugin sends each note's vault-relative path and Markdown content to the MERCENAI sync endpoint selected by the dashboard connection.
 - The connection token is stored with Obsidian SecretStorage. It is not stored in the plugin's `data.json` file.
 - The plugin does not modify vault files, read hidden files, or collect telemetry.
-- A synchronization is rejected when a vault contains more than 300 Markdown notes. Each synchronized note is limited to 200,000 characters.
+- Large vaults are synchronized in server-safe batches. Each synchronized note is limited to 200,000 characters.
 
 ## Development
 

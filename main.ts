@@ -10,9 +10,17 @@ interface MercenaiPluginData {
 }
 
 const CONNECTION_TOKEN_SECRET_ID = "mercenai-vault-sync-token";
-const MAX_FILES = 300;
 const MAX_CHARACTERS_PER_FILE = 200_000;
+const MAX_FILES_PER_BATCH = 250;
+const MAX_CHARACTERS_PER_BATCH = 1_500_000;
+const MAX_KNOWLEDGE_CHUNKS_PER_BATCH = 550;
 const SYNC_DEBOUNCE_MS = 1_200;
+const SYNC_PROTOCOL_VERSION = 2;
+
+type SyncFile = {
+  path: string;
+  content: string;
+};
 
 function supportedNote(file: TFile): boolean {
   return file.extension.toLowerCase() === "md";
@@ -26,6 +34,74 @@ function validEndpoint(value: string): string | null {
   } catch {
     return null;
   }
+}
+
+function createSyncId(): string {
+  return crypto.randomUUID();
+}
+
+function estimatedKnowledgeChunks(content: string): number {
+  const cleaned = content
+    .replace(/\u0000/g, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .trim();
+  if (!cleaned) return 0;
+
+  const sectionWordCounts: number[] = [];
+  let wordCount = 0;
+  const flush = () => {
+    if (wordCount > 0) sectionWordCounts.push(wordCount);
+    wordCount = 0;
+  };
+
+  for (const rawLine of cleaned.split("\n")) {
+    const line = rawLine.trim();
+    if (/^#{1,6}\s+(.+)$/.test(line)) {
+      flush();
+      continue;
+    }
+    if (!line) {
+      if (wordCount >= 90) flush();
+      continue;
+    }
+    wordCount += line.split(/\s+/).filter(Boolean).length;
+  }
+  flush();
+
+  return Math.min(2_000, sectionWordCounts.reduce((total, words) => {
+    return total + (words <= 180 ? 1 : 1 + Math.ceil((words - 180) / 150));
+  }, 0));
+}
+
+function buildSyncBatches(files: SyncFile[]): SyncFile[][] {
+  const batches: SyncFile[][] = [];
+  let batch: SyncFile[] = [];
+  let batchCharacters = 0;
+  let batchChunks = 0;
+
+  for (const file of files) {
+    const fileChunks = estimatedKnowledgeChunks(file.content);
+    if (
+      batch.length > 0 &&
+      (
+        batch.length >= MAX_FILES_PER_BATCH ||
+        batchCharacters + file.content.length > MAX_CHARACTERS_PER_BATCH ||
+        batchChunks + fileChunks > MAX_KNOWLEDGE_CHUNKS_PER_BATCH
+      )
+    ) {
+      batches.push(batch);
+      batch = [];
+      batchCharacters = 0;
+      batchChunks = 0;
+    }
+    batch.push(file);
+    batchCharacters += file.content.length;
+    batchChunks += fileChunks;
+  }
+
+  if (batch.length > 0 || batches.length === 0) batches.push(batch);
+  return batches;
 }
 
 export default class MercenaiVaultSyncPlugin extends Plugin {
@@ -110,35 +186,59 @@ export default class MercenaiVaultSyncPlugin extends Plugin {
       if (!token) {
         throw new Error("MERCENAI connection is missing. Reconnect this vault from the MERCENAI dashboard.");
       }
-      const noteFiles = this.app.vault.getMarkdownFiles().filter(supportedNote);
-      if (noteFiles.length > MAX_FILES) {
-        throw new Error(`This vault has more than ${MAX_FILES} Markdown notes. Nothing was synchronized.`);
+      const capabilityUrl = new URL(this.connection.endpoint);
+      capabilityUrl.searchParams.set("capability", "batched-vault-sync");
+      capabilityUrl.searchParams.set("knowledgeBaseId", this.connection.knowledgeBaseId);
+      const capabilityResponse = await requestUrl({
+        url: capabilityUrl.toString(),
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}` },
+        throw: false
+      });
+      const capability = capabilityResponse.json as { syncProtocol?: number } | undefined;
+      if (capabilityResponse.status < 200 || capabilityResponse.status >= 300 || capability?.syncProtocol !== SYNC_PROTOCOL_VERSION) {
+        throw new Error("MERCENAI vault sync is not ready on this server yet. No notes were synchronized.");
       }
+      const noteFiles = this.app.vault.getMarkdownFiles().filter(supportedNote);
       const files = (
         await Promise.all(noteFiles.map(async (file) => ({
           path: file.path,
           content: (await this.app.vault.cachedRead(file)).trim().slice(0, MAX_CHARACTERS_PER_FILE)
         })))
       ).filter((file) => file.content.length > 0);
-      const response = await requestUrl({
-        url: this.connection.endpoint,
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          knowledgeBaseId: this.connection.knowledgeBaseId,
-          manifestComplete: true,
-          files
-        }),
-        throw: false
-      });
-      const payload = response.json as { message?: string } | undefined;
-      if (response.status < 200 || response.status >= 300) {
-        throw new Error(payload?.message || `MERCENAI sync failed with status ${response.status}.`);
+      const batches = buildSyncBatches(files);
+      const retainedPaths = files.map((file) => file.path);
+      const syncId = createSyncId();
+
+      for (const [batchIndex, batch] of batches.entries()) {
+        const finalBatch = batchIndex === batches.length - 1;
+        const response = await requestUrl({
+          url: this.connection.endpoint,
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            knowledgeBaseId: this.connection.knowledgeBaseId,
+            manifestComplete: true,
+            syncId,
+            batchIndex,
+            batchCount: batches.length,
+            finalBatch,
+            ...(finalBatch ? { retainedPaths } : {}),
+            files: batch
+          }),
+          throw: false
+        });
+        const payload = response.json as { message?: string } | undefined;
+        if (response.status < 200 || response.status >= 300) {
+          throw new Error(payload?.message || `MERCENAI sync failed with status ${response.status}.`);
+        }
       }
-      if (showSuccess) new Notice(payload?.message || "MERCENAI vault sync complete.");
+      if (showSuccess) {
+        new Notice(`${files.length.toLocaleString()} Obsidian note${files.length === 1 ? "" : "s"} synchronized.`);
+      }
     } catch (error) {
       new Notice(error instanceof Error ? error.message : "MERCENAI vault sync failed.");
     } finally {
